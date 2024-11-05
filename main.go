@@ -56,8 +56,15 @@ func (w *Watcher) Watch(stop <-chan struct{}) {
 				log.Println("watcher event channel closed")
 				return
 			}
-			if err := w.handleEventFile(event.Name); err != nil {
-				log.Println(err)
+
+			if _, err := os.Stat(event.Name); os.IsNotExist(err) {
+				if err := w.handleDeleteFile(event.Name); err != nil {
+					log.Println(err)
+				}
+			} else {
+				if err := w.handleEventFile(event.Name); err != nil {
+					log.Println(err)
+				}
 			}
 		case err, ok := <-w.watcher.Errors:
 			if !ok {
@@ -78,7 +85,7 @@ func (w *Watcher) handleEventFile(fileName string) error {
 	}
 	defer f.Close()
 
-	ctx, cancel := context.WithTimeout(w.ctx, time.Second*50)
+	ctx, cancel := context.WithTimeout(w.ctx, time.Minute)
 	defer cancel()
 
 	wc := w.bucket.Object(fileName).NewWriter(ctx)
@@ -95,6 +102,19 @@ func (w *Watcher) handleEventFile(fileName string) error {
 	}
 
 	log.Printf("successfully uploaded file %q to bucket", fileName)
+
+	return nil
+}
+
+func (w *Watcher) handleDeleteFile(fileName string) error {
+	ctx, cancel := context.WithTimeout(w.ctx, time.Minute)
+	defer cancel()
+
+	if err := w.bucket.Object(fileName).Delete(ctx); err != nil {
+		return fmt.Errorf("failed to delete file %q from bucket: %v", fileName, err)
+	}
+
+	log.Printf("successfully deleted file %q from bucket", fileName)
 
 	return nil
 }
