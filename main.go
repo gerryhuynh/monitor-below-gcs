@@ -4,8 +4,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
+	"path"
 	"reflect"
 
 	"cloud.google.com/go/storage"
@@ -17,7 +19,7 @@ func main() {
 	var pathToWatch string
 
 	flag.StringVar(&bucketName, "b", "", "the bucket name")
-	flag.StringVar(&pathToWatch, "p", "", "the path to watch")
+	flag.StringVar(&pathToWatch, "p", "", "the directory path to watch")
 	flag.Parse()
 
 	if bucketName == "" {
@@ -37,6 +39,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to create storage client: %v", err)
 	}
+	defer client.Close()
 
 	bkt := client.Bucket(bucketName)
 	if bkt == nil {
@@ -48,20 +51,50 @@ func main() {
 		log.Fatal(err)
 	}
 
-	w, err := fsnotify.NewWatcher()
+	files, err := os.ReadDir(pathToWatch)
 	if err != nil {
-		log.Fatalf("failed to create watcher: %v", err)
-	}
-	defer w.Close()
-
-	go watch(w)
-
-	err = addPathToWatch(w, pathToWatch)
-	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("failed to read directory %q: %v", pathToWatch, err)
 	}
 
-	<-make(chan struct{})
+	if len(files) == 0 {
+		log.Fatalf("no files found in directory %q", pathToWatch)
+	}
+
+	objName := files[0].Name()
+	wc := bkt.Object(objName).NewWriter(ctx)
+	if wc == nil {
+		log.Fatalf("failed to get object writer for %q", objName)
+	}
+
+	f, err := os.Open(path.Join(pathToWatch, objName))
+	if err != nil {
+		log.Fatalf("failed to open file %q: %v", objName, err)
+	}
+	defer f.Close()
+
+	if _, err = io.Copy(wc, f); err != nil {
+		log.Fatalf("failed to copy file %q to bucket %q: %v", objName, bucketName, err)
+	}
+	if err = wc.Close(); err != nil {
+		log.Fatalf("failed to close writer for %q: %v", objName, err)
+	}
+
+	log.Printf("successfully uploaded file %q to bucket %q", objName, bucketName)
+
+	// w, err := fsnotify.NewWatcher()
+	// if err != nil {
+	// 	log.Fatalf("failed to create watcher: %v", err)
+	// }
+	// defer w.Close()
+
+	// go watch(w)
+
+	// err = addPathToWatch(w, pathToWatch)
+	// if err != nil {
+	// 	log.Fatal(err)
+	// }
+
+	// <-make(chan struct{})
 }
 
 func watch(w *fsnotify.Watcher) {
