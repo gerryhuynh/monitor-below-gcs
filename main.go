@@ -7,28 +7,111 @@ import (
 	"io"
 	"log"
 	"os"
-	"path"
-	"reflect"
+	"time"
 
 	"cloud.google.com/go/storage"
 	"github.com/fsnotify/fsnotify"
 )
 
-func main() {
-	var bucketName string
-	var pathToWatch string
+type Watcher struct {
+	watcher *fsnotify.Watcher
+	bucket  *storage.BucketHandle
+	ctx     context.Context
+}
 
-	flag.StringVar(&bucketName, "b", "", "the bucket name")
-	flag.StringVar(&pathToWatch, "p", "", "the directory path to watch")
+func NewWatcher(bucket *storage.BucketHandle, ctx context.Context, path string) (*Watcher, error) {
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create watcher: %v", err)
+	}
+
+	st, err := os.Lstat(path)
+	if err != nil {
+		w.Close()
+		return nil, fmt.Errorf("failed to stat path: %v", err)
+	}
+
+	if !st.IsDir() {
+		w.Close()
+		return nil, fmt.Errorf("%q is not a directory", path)
+	}
+
+	if err = w.Add(path); err != nil {
+		w.Close()
+		return nil, fmt.Errorf("failed to add path to watcher: %v", err)
+	}
+
+	return &Watcher{watcher: w, bucket: bucket, ctx: ctx}, nil
+}
+
+func (w *Watcher) Close() error {
+	return w.watcher.Close()
+}
+
+func (w *Watcher) Watch(stop <-chan struct{}) {
+	for {
+		select {
+		case event, ok := <-w.watcher.Events:
+			if !ok {
+				log.Println("watcher event channel closed")
+				return
+			}
+			if err := w.handleEventFile(event.Name); err != nil {
+				log.Println(err)
+			}
+		case err, ok := <-w.watcher.Errors:
+			if !ok {
+				log.Println("watcher error channel closed")
+				return
+			}
+			log.Printf("watcher error: %v\n", err)
+		case <-stop:
+			return
+		}
+	}
+}
+
+func (w *Watcher) handleEventFile(fileName string) error {
+	f, err := os.Open(fileName)
+	if err != nil {
+		return fmt.Errorf("failed to open file %q: %v", fileName, err)
+	}
+	defer f.Close()
+
+	ctx, cancel := context.WithTimeout(w.ctx, time.Second*50)
+	defer cancel()
+
+	wc := w.bucket.Object(fileName).NewWriter(ctx)
+	if wc == nil {
+		return fmt.Errorf("failed to get object writer for %q", fileName)
+	}
+
+	if _, err = io.Copy(wc, f); err != nil {
+		return fmt.Errorf("failed to copy file %q to bucket: %v", fileName, err)
+	}
+
+	if err = wc.Close(); err != nil {
+		return fmt.Errorf("failed to close writer for %q: %v", fileName, err)
+	}
+
+	log.Printf("successfully uploaded file %q to bucket", fileName)
+
+	return nil
+}
+
+func main() {
+	var path string
+
+	flag.StringVar(&path, "p", "", "the directory path to watch")
 	flag.Parse()
 
+	bucketName := os.Getenv("GCS_BUCKET")
 	if bucketName == "" {
-		log.Println("Missing bucket name")
-		flag.Usage()
+		log.Println("Missing GCS_BUCKET environment variable")
 		os.Exit(1)
 	}
 
-	if pathToWatch == "" {
+	if path == "" {
 		log.Println("Missing path to watch")
 		flag.Usage()
 		os.Exit(1)
@@ -46,107 +129,16 @@ func main() {
 		log.Fatalf("failed to get bucket %q", bucketName)
 	}
 
-	err = printBucketAttrs(bkt, ctx)
+	w, err := NewWatcher(bkt, ctx, path)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("failed to create watcher: %v", err)
 	}
+	defer w.Close()
 
-	files, err := os.ReadDir(pathToWatch)
-	if err != nil {
-		log.Fatalf("failed to read directory %q: %v", pathToWatch, err)
-	}
+	stopCh := make(chan struct{})
+	defer close(stopCh)
 
-	if len(files) == 0 {
-		log.Fatalf("no files found in directory %q", pathToWatch)
-	}
+	go w.Watch(stopCh)
 
-	objName := files[0].Name()
-	wc := bkt.Object(objName).NewWriter(ctx)
-	if wc == nil {
-		log.Fatalf("failed to get object writer for %q", objName)
-	}
-
-	f, err := os.Open(path.Join(pathToWatch, objName))
-	if err != nil {
-		log.Fatalf("failed to open file %q: %v", objName, err)
-	}
-	defer f.Close()
-
-	if _, err = io.Copy(wc, f); err != nil {
-		log.Fatalf("failed to copy file %q to bucket %q: %v", objName, bucketName, err)
-	}
-	if err = wc.Close(); err != nil {
-		log.Fatalf("failed to close writer for %q: %v", objName, err)
-	}
-
-	log.Printf("successfully uploaded file %q to bucket %q", objName, bucketName)
-
-	// w, err := fsnotify.NewWatcher()
-	// if err != nil {
-	// 	log.Fatalf("failed to create watcher: %v", err)
-	// }
-	// defer w.Close()
-
-	// go watch(w)
-
-	// err = addPathToWatch(w, pathToWatch)
-	// if err != nil {
-	// 	log.Fatal(err)
-	// }
-
-	// <-make(chan struct{})
-}
-
-func watch(w *fsnotify.Watcher) {
-	for {
-		select {
-		case event, ok := <-w.Events:
-			if !ok {
-				return
-			}
-			log.Println("event:", event)
-		case err, ok := <-w.Errors:
-			if !ok {
-				return
-			}
-			log.Println("error:", err)
-		}
-	}
-}
-
-func addPathToWatch(w *fsnotify.Watcher, p string) error {
-	st, err := os.Lstat(p)
-	if err != nil {
-		return fmt.Errorf("failed to stat path: %v", err)
-	}
-
-	if !st.IsDir() {
-		return fmt.Errorf("%q is not a directory", p)
-	}
-
-	err = w.Add(p)
-	if err != nil {
-		return fmt.Errorf("failed to add path to watcher: %v", err)
-	}
-
-	return nil
-}
-
-func printBucketAttrs(bkt *storage.BucketHandle, ctx context.Context) error {
-	attrs, err := bkt.Attrs(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get bucket attrs: %v", err)
-	}
-
-	fmt.Println("Bucket Information:")
-	v := reflect.ValueOf(attrs).Elem()
-	fmt.Println("v")
-	t := v.Type()
-	for i := 0; i < v.NumField(); i++ {
-		field := v.Field(i)
-		fieldName := t.Field(i).Name
-		fmt.Printf("\t%s: %v\n", fieldName, field.Interface())
-	}
-
-	return nil
+	<-stopCh
 }
