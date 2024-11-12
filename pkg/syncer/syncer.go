@@ -9,33 +9,51 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"time"
 
 	"cloud.google.com/go/storage"
-	"github.com/fsnotify/fsnotify"
 	"github.com/gerryhuynh/monitor-below-gcs/pkg/config"
+	"github.com/gerryhuynh/monitor-below-gcs/pkg/watcher"
 )
 
 type Syncer struct {
 	ctx             context.Context
 	config          config.Config
 	bucket          *storage.BucketHandle
-	configUpdatesCh <-chan fsnotify.Event
+	configUpdatesCh <-chan watcher.ConfigEvent
 }
 
-func New(ctx context.Context, config config.Config, bucket *storage.BucketHandle, configUpdatesCh <-chan fsnotify.Event) *Syncer {
+func New(ctx context.Context, config config.Config, bucket *storage.BucketHandle, configUpdatesCh <-chan watcher.ConfigEvent) *Syncer {
 	return &Syncer{ctx: ctx, config: config, bucket: bucket, configUpdatesCh: configUpdatesCh}
 }
 
 func (s *Syncer) Start() error {
+	ticker := time.NewTicker(s.config.UploadFrequency)
+	defer ticker.Stop()
+
+	uploadsEnabled := false
+
+	if err := s.syncBelowLogDir(); err != nil {
+		return fmt.Errorf("error in initial sync: %v", err)
+	}
+
 	for {
 		select {
-		case <-s.configUpdatesCh:
-			if err := s.syncBelowLogDir(); err != nil {
-				return fmt.Errorf("error syncing below log dir: %v", err)
-			}
 		case <-s.ctx.Done():
-			fmt.Println("closing syncer")
-			return nil
+			return s.ctx.Err()
+		case event := <-s.configUpdatesCh:
+			uploadsEnabled = event.HasNode
+			if uploadsEnabled {
+				if err := s.syncBelowLogDir(); err != nil {
+					log.Printf("error syncing below log dir: %v", err)
+				}
+			}
+		case <-ticker.C:
+			if uploadsEnabled {
+				if err := s.syncBelowLogDir(); err != nil {
+					log.Printf("error syncing below log dir: %v", err)
+				}
+			}
 		}
 	}
 }

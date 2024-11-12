@@ -13,6 +13,11 @@ type Nodes struct {
 	Nodes []string `yaml:"nodes"`
 }
 
+type ConfigEvent struct {
+	FSEvent fsnotify.Event
+	HasNode bool
+}
+
 type Watcher struct {
 	watcher     *fsnotify.Watcher
 	configPath  string
@@ -44,8 +49,8 @@ func (w *Watcher) Close() error {
 	return w.watcher.Close()
 }
 
-func (w *Watcher) StartWatch() (<-chan fsnotify.Event, error) {
-	configUpdatesCh := make(chan fsnotify.Event)
+func (w *Watcher) StartWatch() (<-chan ConfigEvent, error) {
+	configUpdatesCh := make(chan ConfigEvent)
 
 	go func() {
 		for {
@@ -56,15 +61,16 @@ func (w *Watcher) StartWatch() (<-chan fsnotify.Event, error) {
 				}
 
 				if event.Op == fsnotify.Write {
-					if ok, err := w.checkNodeInConfig(); err != nil {
+					hasNode, err := w.checkNodeInConfig()
+					if err != nil {
 						fmt.Printf("error checking if node is in config: %v", err)
-						continue
-					} else if !ok {
-						fmt.Printf("node not in config")
 						continue
 					}
 
-					configUpdatesCh <- event
+					configUpdatesCh <- ConfigEvent{
+						FSEvent: event,
+						HasNode: hasNode,
+					}
 				}
 			case err, ok := <-w.watcher.Errors:
 				if !ok {
