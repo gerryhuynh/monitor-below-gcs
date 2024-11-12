@@ -28,3 +28,4 @@ go.work.sum
 var/
 notes.txt
 config.yml
+.DS_Store
