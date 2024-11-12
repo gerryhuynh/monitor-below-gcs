@@ -25,4 +25,6 @@ go.work.sum
 .env
 
 # additional
-temp/
+var/
+notes.txt
+config.yml
